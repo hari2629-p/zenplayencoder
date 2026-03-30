@@ -153,7 +153,44 @@ function writeMasterPlaylist(parsedStreams, hlsDir) {
     fs.writeFileSync(path.join(hlsDir, 'master.m3u8'), masterContent);
 }
 
-function executeFfmpegCommand(inputFile, parsedStreams, hlsDir) {
+const os = require('os');
+
+async function stitchHlsPlaylists(subPlaylistPaths, finalPlaylistPath, hlsDir) {
+    let finalContent = '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:15\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n';
+    let totalSegments = 0;
+
+    for (let i = 0; i < subPlaylistPaths.length; i++) {
+        const content = fs.readFileSync(subPlaylistPaths[i], 'utf8');
+        const lines = content.split('\n');
+        
+        lines.forEach(line => {
+            if (line.startsWith('#EXTINF:')) {
+                finalContent += line + '\n';
+            } else if (line.endsWith('.ts')) {
+                // Rename and move segment to maintain continuous sequence
+                const oldPath = path.join(hlsDir, line);
+                const newFileName = `video_chunk_${String(totalSegments).padStart(3, '0')}.ts`;
+                const newPath = path.join(hlsDir, newFileName);
+                
+                if (fs.existsSync(oldPath)) {
+                    fs.renameSync(oldPath, newPath);
+                }
+                finalContent += newFileName + '\n';
+                totalSegments++;
+            }
+        });
+    }
+
+    finalContent += '#EXT-X-ENDLIST';
+    fs.writeFileSync(finalPlaylistPath, finalContent);
+    
+    // Clean up sub-playlists
+    subPlaylistPaths.forEach(p => {
+        if (fs.existsSync(p)) fs.unlinkSync(p);
+    });
+}
+
+function executeFfmpegCommand(inputFile, parsedStreams, hlsDir, duration) {
     return new Promise(async (resolve, reject) => {
         const hlsOptions = [
             '-f', 'hls',
@@ -163,33 +200,53 @@ function executeFfmpegCommand(inputFile, parsedStreams, hlsDir) {
 
         const tasks = [];
 
-        // 1. Video Encoding Task
+        // 1. Video Encoding Task (Temporal Parallelization)
         if (parsedStreams.videoStreams.length > 0) {
-            tasks.push(new Promise((vResolve, vReject) => {
-                console.log('Starting Video Stream Encoding...');
-                ffmpeg(inputFile)
-                    .outputOptions([
-                        '-map', '0:v:0',
-                        '-c:v', 'libx264',
-                        '-preset', 'fast',
-                        '-crf', '22',
-                        ...hlsOptions,
-                        '-hls_segment_filename', path.join(hlsDir, 'video_chunk_%03d.ts')
-                    ])
-                    .output(path.join(hlsDir, 'video_stream.m3u8'))
-                    .on('end', () => {
-                        console.log('Video Encoding Completed.');
-                        vResolve();
-                    })
-                    .on('error', (err) => {
-                        console.error('Video Encoding Error:', err.message);
-                        vReject(err);
-                    })
-                    .run();
+            tasks.push(new Promise(async (vGrpResolve, vGrpReject) => {
+                const numWorkers = Math.min(os.cpus().length, 4);
+                const partDuration = Math.ceil(duration / numWorkers);
+                const videoTasks = [];
+                const subPlaylists = [];
+
+                console.log(`Dividing video timeline into ${numWorkers} parts for parallel encoding...`);
+
+                for (let i = 0; i < numWorkers; i++) {
+                    const startTime = i * partDuration;
+                    const subPlaylist = path.join(hlsDir, `video_part_${i}.m3u8`);
+                    subPlaylists.push(subPlaylist);
+
+                    videoTasks.push(new Promise((vResolve, vReject) => {
+                        ffmpeg(inputFile)
+                            .inputOptions([`-ss`, String(startTime)])
+                            .outputOptions([
+                                '-t', String(partDuration),
+                                '-map', '0:v:0',
+                                '-c:v', 'libx264',
+                                '-preset', 'fast',
+                                '-crf', '22',
+                                ...hlsOptions,
+                                '-hls_segment_filename', path.join(hlsDir, `video_part_${i}_chunk_%03d.ts`)
+                            ])
+                            .output(subPlaylist)
+                            .on('end', vResolve)
+                            .on('error', vReject)
+                            .run();
+                    }));
+                }
+
+                try {
+                    await Promise.all(videoTasks);
+                    console.log('All video parts transcoded. Stitching playlists...');
+                    await stitchHlsPlaylists(subPlaylists, path.join(hlsDir, 'video_stream.m3u8'), hlsDir);
+                    console.log('Video Stream Unified Successfully.');
+                    vGrpResolve();
+                } catch (err) {
+                    vGrpReject(err);
+                }
             }));
         }
 
-        // 2. Audio Encoding Tasks
+        // 2. Audio Encoding Tasks (Parallel)
         if (parsedStreams.audioStreams.length === 0) {
             tasks.push(new Promise((aResolve, aReject) => {
                 console.log('Starting Silent Audio Generation...');
@@ -199,19 +256,13 @@ function executeFfmpegCommand(inputFile, parsedStreams, hlsDir) {
                         '-map', '0:a',
                         '-c:a', 'aac',
                         '-ac', '2',
-                        '-t', '20', // Should ideally match video duration
+                        '-t', String(duration),
                         ...hlsOptions,
                         '-hls_segment_filename', path.join(hlsDir, 'audio0_chunk_%03d.ts')
                     ])
                     .output(path.join(hlsDir, 'audio_stream_0.m3u8'))
-                    .on('end', () => {
-                        console.log('Silent Audio Generation Completed.');
-                        aResolve();
-                    })
-                    .on('error', (err) => {
-                        console.error('Audio Encoding Error (Silent):', err.message);
-                        aReject(err);
-                    })
+                    .on('end', aResolve)
+                    .on('error', aReject)
                     .run();
             }));
         } else {
@@ -240,7 +291,7 @@ function executeFfmpegCommand(inputFile, parsedStreams, hlsDir) {
             });
         }
 
-        // 3. Subtitle Extraction Task
+        // 3. Subtitle Extraction Task (Parallel)
         if (parsedStreams.subtitleStreams.length > 0) {
             tasks.push(new Promise(async (subGroupResolve, subGroupReject) => {
                 console.log('Starting Subtitle Extraction...');
@@ -271,7 +322,7 @@ function executeFfmpegCommand(inputFile, parsedStreams, hlsDir) {
         }
 
         try {
-            console.log(`Parallelizing ${tasks.length} encoding tasks...`);
+            console.log(`Parallelizing stream and timeline tasks...`);
             await Promise.all(tasks);
             writeMasterPlaylist(parsedStreams, hlsDir);
             resolve();
@@ -314,7 +365,8 @@ async function main() {
         console.log(`Manifest saved to: ${manifestPath}`);
 
         console.log('Starting FFmpeg Processing... This may take a while depending on file size.');
-        await executeFfmpegCommand(resolvedInputPath, parsedStreams, hlsDir);
+        const duration = parseFloat(metadata.format.duration);
+        await executeFfmpegCommand(resolvedInputPath, parsedStreams, hlsDir, duration);
         
         console.log('HLS Encoding process completed successfully!');
     } catch (error) {
