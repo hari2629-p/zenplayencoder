@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ZenStream Local HLS Tester</title>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+    <style>
+        body { font-family: sans-serif; padding: 20px; background: #1a1a1a; color: white; }
+        video { width: 100%; max-width: 800px; border: 1px solid #333; }
+        .controls { margin-bottom: 20px; }
+        input, button { padding: 8px; font-size: 16px; margin-right: 10px; }
+    </style>
+</head>
+<body>
+    <h1>ZenStream HLS Tester</h1>
+    <div class="controls">
+        <label>TMDB ID: </label>
+        <input type="text" id="tmdbId" value="12345" />
+        <button onclick="loadStream()">Load Stream</button>
+    </div>
+    
+    <video id="video" controls></video>
+
+    <script>
+        var video = document.getElementById('video');
+        var hls;
+        var cacheBust = '?cb=' + Date.now();
+
+        function loadStream() {
+            var tmdbId = document.getElementById('tmdbId').value;
+            var videoSrc = './' + tmdbId + '/hls_output/master.m3u8' + cacheBust;
+
+            if (Hls.isSupported()) {
+                if (hls) {
+                    hls.destroy();
+                }
+                hls = new Hls({
+                    xhrSetup: function(xhr, url) {
+                        // Append cache bust to playlists and segments
+                        if (!url.includes('?')) {
+                            xhr.open('GET', url + cacheBust, true);
+                        }
+                    }
+                });
+                hls.loadSource(videoSrc);
+                hls.attachMedia(video);
+                hls.on(Hls.Events.MANIFEST_PARSED, function() {
+                    console.log("Manifest parsed, ready to play.");
+                });
+                hls.on(Hls.Events.ERROR, function(event, data) {
+                    console.error('HLS Error:', data.type, data.details, data.fatal);
+                });
+            } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                video.src = videoSrc;
+            }
+        }
+
+        // Load default stream on start
+        loadStream();
+    </script>
+</body>
+</html>
