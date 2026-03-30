@@ -155,89 +155,124 @@ function writeMasterPlaylist(parsedStreams, hlsDir) {
 
 function executeFfmpegCommand(inputFile, parsedStreams, hlsDir) {
     return new Promise(async (resolve, reject) => {
-        // Store all chunks flat inside hls_output but with distinct prefixes
-        // video_chunk_NNN.ts, audio0_chunk_NNN.ts, etc.
-        // This avoids subdirectory relative-path issues in the m3u8.
         const hlsOptions = [
             '-f', 'hls',
             '-hls_time', '10',
             '-hls_playlist_type', 'vod',
         ];
 
-        try {
-            if (parsedStreams.videoStreams.length > 0) {
-                console.log('Encoding Video Stream...');
-                await new Promise((vResolve, vReject) => {
+        const tasks = [];
+
+        // 1. Video Encoding Task
+        if (parsedStreams.videoStreams.length > 0) {
+            tasks.push(new Promise((vResolve, vReject) => {
+                console.log('Starting Video Stream Encoding...');
+                ffmpeg(inputFile)
+                    .outputOptions([
+                        '-map', '0:v:0',
+                        '-c:v', 'libx264',
+                        '-preset', 'fast',
+                        '-crf', '22',
+                        ...hlsOptions,
+                        '-hls_segment_filename', path.join(hlsDir, 'video_chunk_%03d.ts')
+                    ])
+                    .output(path.join(hlsDir, 'video_stream.m3u8'))
+                    .on('end', () => {
+                        console.log('Video Encoding Completed.');
+                        vResolve();
+                    })
+                    .on('error', (err) => {
+                        console.error('Video Encoding Error:', err.message);
+                        vReject(err);
+                    })
+                    .run();
+            }));
+        }
+
+        // 2. Audio Encoding Tasks
+        if (parsedStreams.audioStreams.length === 0) {
+            tasks.push(new Promise((aResolve, aReject) => {
+                console.log('Starting Silent Audio Generation...');
+                ffmpeg()
+                    .input('anullsrc').inputFormat('lavfi')
+                    .outputOptions([
+                        '-map', '0:a',
+                        '-c:a', 'aac',
+                        '-ac', '2',
+                        '-t', '20', // Should ideally match video duration
+                        ...hlsOptions,
+                        '-hls_segment_filename', path.join(hlsDir, 'audio0_chunk_%03d.ts')
+                    ])
+                    .output(path.join(hlsDir, 'audio_stream_0.m3u8'))
+                    .on('end', () => {
+                        console.log('Silent Audio Generation Completed.');
+                        aResolve();
+                    })
+                    .on('error', (err) => {
+                        console.error('Audio Encoding Error (Silent):', err.message);
+                        aReject(err);
+                    })
+                    .run();
+            }));
+        } else {
+            parsedStreams.audioStreams.forEach((aStream, index) => {
+                tasks.push(new Promise((aResolve, aReject) => {
+                    console.log(`Starting Audio Stream ${index} Encoding...`);
                     ffmpeg(inputFile)
                         .outputOptions([
-                            '-map', '0:v:0',
-                            '-c:v', 'libx264',
-                            '-preset', 'fast',
-                            '-crf', '22',
-                            ...hlsOptions,
-                            '-hls_segment_filename', path.join(hlsDir, 'video_chunk_%03d.ts')
-                        ])
-                        .output(path.join(hlsDir, 'video_stream.m3u8'))
-                        .on('end', vResolve)
-                        .on('error', vReject)
-                        .run();
-                });
-            }
-
-            console.log('Encoding Audio Streams...');
-            if (parsedStreams.audioStreams.length === 0) {
-                await new Promise((aResolve, aReject) => {
-                    ffmpeg()
-                        .input('anullsrc').inputFormat('lavfi')
-                        .outputOptions([
-                            '-map', '0:a',
+                            '-map', `0:a:${index}`,
                             '-c:a', 'aac',
                             '-ac', '2',
-                            '-t', '20',
                             ...hlsOptions,
-                            '-hls_segment_filename', path.join(hlsDir, 'audio0_chunk_%03d.ts')
+                            '-hls_segment_filename', path.join(hlsDir, `audio${index}_chunk_%03d.ts`)
                         ])
-                        .output(path.join(hlsDir, 'audio_stream_0.m3u8'))
-                        .on('end', aResolve)
-                        .on('error', aReject)
+                        .output(path.join(hlsDir, `audio_stream_${index}.m3u8`))
+                        .on('end', () => {
+                            console.log(`Audio Stream ${index} Encoding Completed.`);
+                            aResolve();
+                        })
+                        .on('error', (err) => {
+                            console.error(`Audio Stream ${index} Error:`, err.message);
+                            aReject(err);
+                        })
                         .run();
-                });
-            } else {
-                for (let index = 0; index < parsedStreams.audioStreams.length; index++) {
-                    await new Promise((aResolve, aReject) => {
+                }));
+            });
+        }
+
+        // 3. Subtitle Extraction Task
+        if (parsedStreams.subtitleStreams.length > 0) {
+            tasks.push(new Promise(async (subGroupResolve, subGroupReject) => {
+                console.log('Starting Subtitle Extraction...');
+                const subtitleTracks = parsedStreams.subtitleStreams.map((sStream, index) => {
+                    return new Promise((subResolve, subReject) => {
+                        const subPath = path.join(hlsDir, 'Subtitle_Files', `subtitle_${index}.vtt`);
                         ffmpeg(inputFile)
                             .outputOptions([
-                                '-map', `0:a:${index}`,
-                                '-c:a', 'aac',
-                                '-ac', '2',
-                                ...hlsOptions,
-                                '-hls_segment_filename', path.join(hlsDir, `audio${index}_chunk_%03d.ts`)
+                                '-map', `0:s:${index}`,
+                                '-c:s', 'webvtt'
                             ])
-                            .output(path.join(hlsDir, `audio_stream_${index}.m3u8`))
-                            .on('end', aResolve)
-                            .on('error', aReject)
+                            .output(subPath)
+                            .on('end', subResolve)
+                            .on('error', subReject)
                             .run();
                     });
-                }
-            }
-
-            console.log('Extracting Subtitles...');
-            const subtitlePromises = parsedStreams.subtitleStreams.map((sStream, index) => {
-                return new Promise((subResolve, subReject) => {
-                    const subPath = path.join(hlsDir, 'Subtitle_Files', `subtitle_${index}.vtt`);
-                    ffmpeg(inputFile)
-                        .outputOptions([
-                            '-map', `0:s:${index}`,
-                            '-c:s', 'webvtt'
-                        ])
-                        .output(subPath)
-                        .on('end', subResolve)
-                        .on('error', subReject)
-                        .run();
                 });
-            });
-            await Promise.all(subtitlePromises);
 
+                try {
+                    await Promise.all(subtitleTracks);
+                    console.log('Subtitle Extraction Completed.');
+                    subGroupResolve();
+                } catch (err) {
+                    console.error('Subtitle Extraction Error:', err.message);
+                    subGroupReject(err);
+                }
+            }));
+        }
+
+        try {
+            console.log(`Parallelizing ${tasks.length} encoding tasks...`);
+            await Promise.all(tasks);
             writeMasterPlaylist(parsedStreams, hlsDir);
             resolve();
         } catch (err) {
